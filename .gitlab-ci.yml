@@ -1,0 +1,72 @@
+# Dev / Stage / Live pipeline
+#
+#   develop -> Dev    (automatic)
+#   stage   -> Stage  (automatic)
+#   main    -> Live   (manual button, after Stage was approved)
+#
+# Per-environment CI/CD variables (Settings -> CI/CD -> Variables, "Environment scope"):
+#   DEPLOY_HOST, DEPLOY_USER, APP_DIR, HEALTH_URL, SSH_PRIVATE_KEY, SSH_KNOWN_HOSTS
+# Optional:
+#   POST_DEPLOY_CMD   e.g. "php artisan migrate --force && php artisan optimize"
+
+stages:
+  - validate
+  - deploy
+
+variables:
+  PHP_IMAGE: php:8.4-cli
+
+validate:
+  stage: validate
+  image: $PHP_IMAGE
+  script:
+    # Fail on any PHP syntax error before anything is deployed.
+    # Add your test suite and linters here as the project grows.
+    - find . -name "*.php" -not -path "./vendor/*" -print0 | xargs -0 -r -n1 php -l > /dev/null
+  rules:
+    - if: $CI_PIPELINE_SOURCE == "merge_request_event"
+    - if: $CI_COMMIT_BRANCH
+
+.deploy:
+  stage: deploy
+  image: alpine:3.20
+  resource_group: $CI_ENVIRONMENT_NAME   # never run two deploys to the same environment at once
+  before_script:
+    - apk add --no-cache openssh-client rsync curl
+    - eval "$(ssh-agent -s)"
+    - echo "$SSH_PRIVATE_KEY" | tr -d '\r' | ssh-add -
+    - mkdir -p ~/.ssh && chmod 700 ~/.ssh
+    - echo "$SSH_KNOWN_HOSTS" > ~/.ssh/known_hosts
+  script:
+    - >
+      rsync -az --delete
+      --exclude ".git/" --exclude ".env" --exclude "storage/" --exclude "node_modules/"
+      ./ "$DEPLOY_USER@$DEPLOY_HOST:$APP_DIR/"
+    - |
+      if [ -n "$POST_DEPLOY_CMD" ]; then
+        ssh "$DEPLOY_USER@$DEPLOY_HOST" "cd '$APP_DIR' && $POST_DEPLOY_CMD"
+      fi
+    # The job fails if the site does not answer with 2xx, so a broken release turns the pipeline red.
+    - curl --fail --silent --show-error --max-time 20 --retry 5 --retry-delay 3 "$HEALTH_URL" > /dev/null
+
+deploy_dev:
+  extends: .deploy
+  environment:
+    name: dev
+  rules:
+    - if: $CI_COMMIT_BRANCH == "develop"
+
+deploy_stage:
+  extends: .deploy
+  environment:
+    name: stage
+  rules:
+    - if: $CI_COMMIT_BRANCH == "stage"
+
+deploy_live:
+  extends: .deploy
+  environment:
+    name: live
+  rules:
+    - if: $CI_COMMIT_BRANCH == "main"
+      when: manual
